@@ -8,7 +8,7 @@ class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-
+    # sinusoidal position embedding
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2

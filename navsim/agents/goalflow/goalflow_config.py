@@ -5,7 +5,7 @@ from nuplan.common.maps.abstract_map import SemanticMapLayer
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
-
+# 数据结构
 @dataclass
 class GoalFlowConfig:
     # 1.flow_unet params

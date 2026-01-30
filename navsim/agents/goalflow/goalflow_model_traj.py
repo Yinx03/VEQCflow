@@ -26,16 +26,20 @@ class GoalFlowTrajModel(nn.Module):
         ]
 
         self._config = config
+        # V299Backbone: perception backbone
         # self._backbone = goalflowBackbone(config)
-        self._backbone=V299Backbone(config)
-        if not self._config.voc_path=='':
+        self._backbone=V299Backbone(config) # 1.fusion backbone: image + lidar
+        
+        # 2.GoalPoint clustering points for student navigation(目标点词汇表)
+        if not self._config.voc_path=='': 
             self.cluster_points=np.load(self._config.voc_path)
 
         # usually, the BEV features are variable in size.
         self._bev_downscale = nn.Conv2d(512, config.tf_d_model, kernel_size=1)
 
+        # 3.BEV semantic segmentation head(BEV语义分割头)
         self._bev_semantic_head = nn.Sequential(
-            nn.Conv2d(
+            nn.Conv2d( # 3x3卷积特征提取
                 config.bev_features_channels,
                 config.bev_features_channels,
                 kernel_size=(3, 3),
@@ -44,7 +48,7 @@ class GoalFlowTrajModel(nn.Module):
                 bias=True,
             ),
             nn.ReLU(inplace=True),
-            nn.Conv2d(
+            nn.Conv2d( # 1x1卷积分类
                 config.bev_features_channels,
                 config.num_bev_classes,
                 kernel_size=(1, 1),
@@ -52,49 +56,53 @@ class GoalFlowTrajModel(nn.Module):
                 padding=0,
                 bias=True,
             ),
-            nn.Upsample(
+            nn.Upsample( # 上采样到与LiDAR分辨率相同
                 size=(config.lidar_resolution_height // 2, config.lidar_resolution_width),
                 mode="bilinear",
                 align_corners=False,
             ),
         )
-
+        # 4.QKV embedding
         self._keyval_embedding = nn.Embedding(
             8**2 + 1, config.tf_d_model
-        )  # 8x8 feature grid + trajectory
-        self._query_embedding = nn.Embedding(sum(self._query_splits), config.tf_d_model)
-        self._status_encoding=nn.Linear(4+2+2,config.tf_d_model)
+        )  # (8x8 feature grid + trajectory) x tf_d_model
+        self._query_embedding = nn.Embedding(sum(self._query_splits), config.tf_d_model) # 31x256
+        
+        self._status_encoding=nn.Linear(4+2+2,config.tf_d_model) # Ego Status Encoding(车辆状态编码)
         # self._status_encoding=nn.Linear((4+3+2+2)*4,config.tf_d_model)
 
-        tf_decoder_layer = nn.TransformerDecoderLayer(
+        
+        tf_decoder_layer = nn.TransformerDecoderLayer( # Transformer decoder layer
             d_model=config.tf_d_model,
             nhead=config.tf_num_head,
             dim_feedforward=config.tf_d_ffn,
             dropout=config.tf_dropout,
             batch_first=True,
         )
-
+        # 5.Transformer decoder: 理解场景上下文，生成场景特征向量
         self._tf_decoder = nn.TransformerDecoder(tf_decoder_layer, config.tf_num_layers)
         self._agent_head = AgentHead(
             num_agents=config.num_bounding_boxes,
             d_ffn=config.tf_d_ffn,
             d_model=config.tf_d_model,
         )
-
+        # 6.Diffusion-based trajectory generation components(Flow Matching)
         if not self._config.only_perception:
             # diffusion es: https://github.com/bhyang/diffusion-es
+            # a.Noise level encoder (sigma encoder)
             self.sigma_encoder = nn.Sequential(
-                SinusoidalPosEmb(self._config.tf_d_model),
+                SinusoidalPosEmb(self._config.tf_d_model), # 正弦位置编码
                 nn.Linear(self._config.tf_d_model, self._config.tf_d_model),
                 nn.ReLU(),
                 nn.Linear(self._config.tf_d_model, self._config.tf_d_model)
             )
+            # b.Sigma projection layer
             self.sigma_proj_layer = nn.Linear(self._config.tf_d_model * 2, self._config.tf_d_model)
-
+            # c.Trajectory encoder and time embeddings
             self.trajectory_encoder = nn.Linear(30, self._config.tf_d_model)
             self.trajectory_time_embeddings = RotaryPositionEncoding(self._config.tf_d_model)
             self.type_embedding = nn.Embedding(30, self._config.tf_d_model) # trajectory, noise token
-
+            # d.Denoise network(8层并行注意力层)
             self.global_attention_layers = torch.nn.ModuleList([
                 ParallelAttentionLayer(
                     d_model=self._config.tf_d_model, 
@@ -103,13 +111,13 @@ class GoalFlowTrajModel(nn.Module):
                     rotary_pe=True
                 )
             for _ in range(8)])
-
+            # e.Decoder MLP(MLP输出去噪轨迹)
             self.decoder_mlp = nn.Sequential(
                 nn.Linear(self._config.tf_d_model, self._config.tf_d_model),
                 nn.ReLU(),
                 nn.Linear(self._config.tf_d_model, 30)
-            )
-
+            ) # Sequential Container
+        # 7.Freeze perception modules if specified(冻结感知模块，用于迁移学习)
         if self._config.freeze_perception:
             self.freeze_layers(self._backbone)
             self.freeze_layers(self._bev_downscale)
@@ -126,23 +134,30 @@ class GoalFlowTrajModel(nn.Module):
             param.requires_grad = False
 
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        def minmax(t_tensor):
+        def minmax(t_tensor): # normalize to [0,1](最大最小归一化)
             batch_min=torch.min(t_tensor,dim=-1).values.unsqueeze(-1)
             batch_max=torch.max(t_tensor,dim=-1).values.unsqueeze(-1)
             return (t_tensor-batch_min)/(batch_max-batch_min)
-        token=features['token']
+        
+        # 1.Extract features from input tensors(输入特征提取)
+        token=features['token'] # 场景识别符
         camera_feature: torch.Tensor = features["camera_feature"]
         lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
 
+        # 2.Extract BEV features from backbone(骨干网络提取BEV特征)
         batch_size = status_feature.shape[0]
-
+        
+        # 高分辨率BEV特征用于语义分割头，低分辨率BEV特征用于Transformer decoder
         bev_feature_upscale, bev_feature, _ = self._backbone(camera_feature, lidar_feature)
         # bev_feature_upscale(bz,64,64,64), bev_feature(bz,512,8,8)
 
-        bev_feature = self._bev_downscale(bev_feature).flatten(-2, -1)
-        bev_feature = bev_feature.permute(0, 2, 1)
-        # bev_feature(bz,64,256)
+        bev_feature = self._bev_downscale(bev_feature).flatten(-2, -1) #(batch_size, channels, new_height * new_width)
+        
+        # resort: (batch_size, seq_length, feature_dim)
+        bev_feature = bev_feature.permute(0, 2, 1) # bev_feature(bz,64,256)
+        
+        # 3.Get ground-truth trajectories(获取真实轨迹)
         gt_trajs=features['gt_trajs'].to(status_feature)
         dtype=status_feature.dtype
         device=status_feature.device
@@ -151,21 +166,23 @@ class GoalFlowTrajModel(nn.Module):
         # =================================== perception ==================================================
         if self._config.has_history:
             used_dims=[0,1,2,3,7,8,9,10]
-            status_encoding = self._status_encoding(status_feature[:,-1,used_dims])
+            status_encoding = self._status_encoding(status_feature[:,-1,used_dims]) # 自车特征状态编码
         else:
             status_encoding=self._status_encoding(status_feature)
         # status_encoding (1,256)
 
-        keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
-        keyval += self._keyval_embedding.weight[None, ...]
+        keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1) # [B,seq_length,D]
+        keyval += self._keyval_embedding.weight[None, ...] # + learnable position embedding
 
         query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
-        query_out = self._tf_decoder(query, keyval)
+        query_out = self._tf_decoder(query, keyval) # Cross-attention(Scene understanding)
 
-        trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
-
+        trajectory_query, agents_query = query_out.split(self._query_splits, dim=1) # 特征分离
+        
+        # 辅助任务：检测和BEV语义分割
         agents = self._agent_head(agents_query)
-        bev_semantic_map = self._bev_semantic_head(bev_feature_upscale)
+
+        bev_semantic_map = self._bev_semantic_head(bev_feature_upscale) # 高分辨率BEV用于语义分割头
 
         if self._config.only_perception:
             output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
@@ -175,11 +192,11 @@ class GoalFlowTrajModel(nn.Module):
 
         # =================================== flow ==================================================
         target=gt_trajs
-        if self._config.has_navi:
+        if self._config.has_navi: # 1.Teacher forcing:从真值轨迹中取目标点
             navi=gt_trajs[:,7:8,:2].clone().to(device)
             navi_feature=pos2posemb2d(navi,num_pos_feats=self._config.tf_d_model//2).squeeze(1)
             global_feature=trajectory_query.squeeze(1)
-        elif self._config.has_student_navi:
+        elif self._config.has_student_navi: # 2.Inference:从预先计算好的分数中选取目标点
             if isinstance(features['token'], str):
                 if os.path.isfile(f'{self._config.score_path}/im/{token[i]}.npy'):
                     im_score=np.load(f'{self._config.score_path}/im/{token[i]}.npy')
@@ -200,6 +217,7 @@ class GoalFlowTrajModel(nn.Module):
                 else:
                     final_scores=0.1*torch.log(torch.nn.functional.softmax(im_scores.squeeze(),dim=-1)+1e-7)+self._config.theta*torch.log(torch.sigmoid(dac_scores.squeeze())+1e-7)
                 
+                # 筛选出得分最高的目标点 g 并编码为 navi_feature
                 navi=cluster_points_tensor[final_scores.argmax()][:2].unsqueeze(0).unsqueeze(0)
                 navi_feature=pos2posemb2d(navi,num_pos_feats=self._config.tf_d_model//2).squeeze(1).to(gt_trajs)
                 global_feature=trajectory_query.squeeze(1)
@@ -223,6 +241,7 @@ class GoalFlowTrajModel(nn.Module):
                 if self._config.ep_point_weight>0.0:
                     goal_distance=torch.norm(cluster_points_tensor[...,:2],dim=-1)
                     goal_distance_norm=minmax(goal_distance)
+                    # Final Score Calculation = 0.1*log(softmax(im_score)) + theta*log(sigma(dac_score))
                     final_scores=0.1*torch.log(torch.nn.functional.softmax(im_scores.squeeze(),dim=-1)+1e-7)+self._config.theta*torch.log(torch.sigmoid(dac_scores.squeeze())+1e-7)\
                             +self._config.ep_point_weight*goal_distance_norm
                 else:
@@ -233,19 +252,24 @@ class GoalFlowTrajModel(nn.Module):
                 navi=torch.gather(cluster_points_tensor,dim=1,index=topk_indices).mean(1)[...,:2].unsqueeze(1)
                 navi_feature=pos2posemb2d(navi,num_pos_feats=self._config.tf_d_model//2).squeeze(1).to(gt_trajs)
                 global_feature=trajectory_query.squeeze(1)
-        else:
+        else: # 3.无目标点条件时使用全局特征
             global_feature=trajectory_query.squeeze(1)
 
         if gt_trajs.shape[-2]==12:
             gt_trajs=gt_trajs[...,:11,:]
         gt_trajs_=gt_trajs.clone()
+
+        # preprocess trajectories for flow model
         if self._config.start:
             start_point=torch.zeros((gt_trajs.shape[0],1,3)).to(gt_trajs)
-            gt_trajs_=torch.cat([start_point,gt_trajs_],dim=1)
+            gt_trajs_=torch.cat([start_point,gt_trajs_],dim=1) # add start point(添加起始点)
 
         target=torch.zeros_like(gt_trajs_)
+        
+        # Ground Truth Normalization + rotation(真实轨迹归一化即 FlowMatching Target)
         normal_trajs = self.normalize_xy_rotation(gt_trajs_, N=gt_trajs_.shape[-2], times=10).to(gt_trajs_)
         if self._config.training:
+            # 1.采样随机高斯噪声
             noise=torch.randn(size=(batch_size,12,30),device=normal_trajs.device,dtype=dtype).to(global_feature)*self._config.train_scale
         else:
             noise=torch.randn(size=(batch_size*self._config.anchor_size,12,30),dtype=dtype,device=device)*self._config.test_scale
@@ -263,20 +287,28 @@ class GoalFlowTrajModel(nn.Module):
             batch_size = normal_trajs.shape[0]
 
             if self._config.start:
-                noise[:,[0],:]=normal_trajs[:,[0],:]
+                noise[:,[0],:]=normal_trajs[:,[0],:]    # 起点固定不加噪声
 
+            # 2.生成训练数据
             noisy_traj_points,t,target=get_train_tuple(z0=noise,z1=normal_trajs)
+            # z_t=t*z1+(1-t)*z0, target=dz/dt=z1-z0
 
-            timesteps=t*self._config.infer_steps
+
+            timesteps=t*self._config.infer_steps # scale to [0, infer_steps]
             
             import random
+            # 3.Classifier-Free Guidance:用于增强生成结果对条件的依从性
             if self._config.has_navi:
+            
                 flag=random.randint(1,3)
                 if flag==1:
+                    # a.完整条件输入: navi + scene feature
                     pred=self.denoise(noisy_traj_points,timesteps,global_feature).reshape(batch_size,-1,30)
                 elif flag==2:
+                    # b.去掉所有条件输入
                     pred=self.denoise(noisy_traj_points,timesteps,global_feature,force_dropout=True).reshape(batch_size,-1,30)
                 elif flag==3:
+                    # c.去掉navi条件输入(Shadow Mode): only scene feature
                     pred=self.denoise(noisy_traj_points,timesteps,global_feature,navi_dropout=True).reshape(batch_size,-1,30)
             else:
                 flag=random.randint(1,2)
@@ -287,12 +319,13 @@ class GoalFlowTrajModel(nn.Module):
         
         # =================================== flow sampling ==================================================
         else:
-
+            # 采样多条轨迹候选
             trajs=noise
             if self._config.start:
                 trajs[:,[0],:]=normal_trajs[:1,[0],:]
 
             if self._config.has_navi or self._config.has_student_navi:
+                # 复制全局特征以匹配多条轨迹
                 features=global_feature[0].unsqueeze(1).repeat(1,self._config.anchor_size,1,1).view(-1,2,self._config.tf_d_model)
                 embedding=global_feature[1].unsqueeze(1).repeat(1,self._config.anchor_size,1,1).view(-1,2,self._config.tf_d_model)
                 global_feature=(features,embedding)
@@ -308,6 +341,7 @@ class GoalFlowTrajModel(nn.Module):
                 t_shifted = 1-(self._config.alpha * timesteps) / (1 + (self._config.alpha - 1) * timesteps)
                 t_shifted = t_shifted.flip(0)
                 t_shifted*=self._config.infer_steps
+                # 1.生成有条件轨迹(Goal-Driven)
                 for t_curr, t_prev in zip(t_shifted[:-1], t_shifted[1:]):
                     step = t_prev - t_curr
                     net_output_cond=self.denoise(trajs,t_curr,global_feature)
@@ -315,6 +349,7 @@ class GoalFlowTrajModel(nn.Module):
                     trajs=trajs.detach().clone()+net_output_cond*(step / self._config.infer_steps)
                 diffusion_output_cond = self.denormalize_xy_rotation(trajs, N=gt_trajs.shape[-2], times=10)
                 diffusion_output_cond=diffusion_output_cond.reshape(batch_size,self._config.anchor_size,-1,3)
+                
                 if self._config.use_nearest:
                     distances=torch.norm(diffusion_output_cond[:,:,8,:2]-navi,dim=-1)
                     scores=distances
@@ -351,7 +386,8 @@ class GoalFlowTrajModel(nn.Module):
             # ========================== only use main trajectory ========================================
             else:
                 if self._config.cur_sampling:
-                    timesteps = torch.linspace(0, 1, self._config.infer_steps+1).to(device)
+                    timesteps = torch.linspace(0, 1, self._config.infer_steps+1).to(device) # [0,0.1,0.2,...,1.0]
+                    # 非线性变换: 1-(α*t)/(1+(α-1)*t), emphasis on early steps
                     t_shifted = 1-(self._config.alpha * timesteps) / (1 + (self._config.alpha - 1) * timesteps)
                     t_shifted = t_shifted.flip(0)
                     t_shifted*=self._config.infer_steps
@@ -359,6 +395,7 @@ class GoalFlowTrajModel(nn.Module):
                     for t_curr, t_prev in zip(t_shifted[:-1], t_shifted[1:]):
                         step = t_prev - t_curr
                         if not self._config.cond_weight==1.0:
+                            # predict velocity field
                             net_output_nonavi=self.denoise(trajs,t_curr,global_feature,navi_dropout=True)
                             net_output_cond=self.denoise(trajs,t_curr,global_feature)
                             net_output=((1.-self._config.cond_weight)*net_output_nonavi+self._config.cond_weight*net_output_cond).reshape(self._config.anchor_size*batch_size,12,30)
@@ -370,6 +407,7 @@ class GoalFlowTrajModel(nn.Module):
                             else:
                                 net_output_nonavi=self.denoise(trajs,t_curr,global_feature)
                             net_output=net_output_nonavi.reshape(self._config.anchor_size*batch_size,12,30)
+                        # update trajectory: x_(t+delta_t) = x_t + v_theta(x_t,<t_curr>) * delta_t
                         trajs=trajs.detach().clone()+net_output*(step / self._config.infer_steps)
 
                 else:
@@ -394,12 +432,17 @@ class GoalFlowTrajModel(nn.Module):
 
             # ========================== trajectory scorer ========================================
             if self._config.use_nearest and not self._config.fusion:
+                # 计算每条预测轨迹与目标点之间的距离
                 distances=torch.norm(pred_trajs[:,:,8,:2]-navi,dim=-1)
                 scores=distances
+
                 if self._config.ep_score_weight>0.0:
+                    # a.距离成本(衡量任务的完成度)
                     distances_norm=minmax(distances)
+                    # b.进展收益(衡量驾驶效率)
                     progress=torch.norm(pred_trajs[:,:,8,:2],dim=-1)
                     progress_norm=minmax(progress)
+                    # Final Score Calculation
                     scores=(1.-self._config.ep_score_weight)*distances_norm-self._config.ep_score_weight*progress_norm
                 min_index=torch.argmin(scores,dim=1)
                 pred_trajs=pred_trajs[torch.arange(batch_size),min_index].unsqueeze(1)
@@ -444,7 +487,8 @@ class GoalFlowTrajModel(nn.Module):
     def denoise(self, ego_trajectory, sigma, state_features,force_dropout=False,navi_dropout=False):
         batch_size = ego_trajectory.shape[0]
 
-        state_features, state_type_embedding = state_features
+        # [Batch, Feature Tokens, Feature Dim]
+        state_features, state_type_embedding = state_features # (Environment+Goal) Context Features
         
         # Trajectory features
         ego_trajectory = ego_trajectory.reshape(ego_trajectory.shape[0],12,30)
@@ -454,28 +498,29 @@ class GoalFlowTrajModel(nn.Module):
             torch.as_tensor([1], device=ego_trajectory.device)
         )[None].repeat(batch_size,12,1)
 
-        # Concatenate all features
-        if navi_dropout:
-            state_features[:,-1,:]*=0
+        # Concatenate all features，using dropout for classifier-free guidance
+        if navi_dropout: # switch Goal-Driven to Shadow Mode
+            state_features[:,-1,:]*=0 # Mask Goal Feature
         all_features = torch.cat([state_features, trajectory_features], dim=1)
         if force_dropout:
-            all_features=all_features*0
+            all_features=all_features*0 # Mask All Context Features
         all_type_embedding = torch.cat([state_type_embedding, trajectory_type_embedding], dim=1)
 
-        # Sigma encoding
+        # Sigma encoding(时间步编码)
         sigma = sigma.reshape(-1,1)
         if sigma.numel() == 1:
             sigma = sigma.repeat(batch_size,1)
         sigma = sigma.float() / self._config.infer_steps
-        sigma_embeddings = self.sigma_encoder(sigma)
+        sigma_embeddings = self.sigma_encoder(sigma) # using sinusoidal pos embedding [B,1,256]
         sigma_embeddings = sigma_embeddings.reshape(batch_size,1,self._config.tf_d_model)
 
         # Concatenate sigma features and project back to original feature_dim
-        sigma_embeddings = sigma_embeddings.repeat(1,all_features.shape[1],1)
-        all_features = torch.cat([all_features, sigma_embeddings], dim=2)
-        all_features = self.sigma_proj_layer(all_features)
+        sigma_embeddings = sigma_embeddings.repeat(1,all_features.shape[1],1) # [B, 14, 256]
+        all_features = torch.cat([all_features, sigma_embeddings], dim=2) # [B, 14, 512]
+        all_features = self.sigma_proj_layer(all_features) # [B, 14, 256]
 
         # Generate attention mask
+        # Local attention mask for trajectory points(迫使模型关注局部平滑性)
         seq_len = all_features.shape[1]
         indices = torch.arange(seq_len, device=all_features.device)
         dists = (indices[None] - indices[:,None]).abs()
@@ -488,9 +533,9 @@ class GoalFlowTrajModel(nn.Module):
         for layer in self.global_attention_layers:            
             all_features, _ = layer(
                 all_features, None, None, None,
-                seq1_pos=temporal_embedding,
-                seq1_sem_pos=all_type_embedding,
-                attn_mask_11=attn_mask
+                seq1_pos=temporal_embedding, # 时序位置编码
+                seq1_sem_pos=all_type_embedding, # 语义类型编码
+                attn_mask_11=attn_mask # 局部注意力掩码
             )
 
         trajectory_features = all_features[:,-12:]
